@@ -609,6 +609,160 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	return logs, total, err
 }
 
+// GetAllLogsWithContext is the context-aware version of GetAllLogs for exports
+func GetAllLogsWithContext(ctx context.Context, startTimestamp int64, endTimestamp int64, modelName string, content string, username string, tokenName string, logType int, channel int, limit int, offset int) (logs []*Log, total int64, err error) {
+	var tx *gorm.DB
+	if logType == LogTypeUnknown {
+		tx = LOG_DB.WithContext(ctx)
+	} else {
+		tx = LOG_DB.WithContext(ctx).Where("logs.type = ?", logType)
+	}
+
+	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
+		return nil, 0, err
+	}
+	if tx, err = applyExplicitLogTextFilter(tx, "logs.username", username); err != nil {
+		return nil, 0, err
+	}
+	if tx, err = applyExplicitLogTextFilter(tx, "logs.content", content); err != nil {
+		return nil, 0, err
+	}
+	if tokenName != "" {
+		tx = tx.Where("logs.token_name = ?", tokenName)
+	}
+	if startTimestamp != 0 {
+		tx = tx.Where("logs.created_at >= ?", startTimestamp)
+	}
+	if endTimestamp != 0 {
+		tx = tx.Where("logs.created_at <= ?", endTimestamp)
+	}
+	if channel != 0 {
+		tx = tx.Where("logs.channel_id = ?", channel)
+	}
+
+	// Check context before count
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
+
+	err = tx.Model(&Log{}).Count(&total).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Check context before query
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
+
+	order := "logs.created_at desc, logs.id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("logs.")
+	}
+	err = tx.Order(order).Limit(limit).Offset(offset).Find(&logs).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		assignDisplayLogIds(logs, offset)
+	}
+
+	// Fetch channel names
+	channelIds := types.NewSet[int]()
+	for _, log := range logs {
+		if log.ChannelId != 0 {
+			channelIds.Add(log.ChannelId)
+		}
+	}
+
+	if channelIds.Len() > 0 {
+		var channels []struct {
+			Id   int    `gorm:"column:id"`
+			Name string `gorm:"column:name"`
+		}
+		if common.MemoryCacheEnabled {
+			for _, channelId := range channelIds.Items() {
+				if cacheChannel, err := CacheGetChannel(channelId); err == nil {
+					channels = append(channels, struct {
+						Id   int    `gorm:"column:id"`
+						Name string `gorm:"column:name"`
+					}{
+						Id:   channelId,
+						Name: cacheChannel.Name,
+					})
+				}
+			}
+		} else {
+			if err = DB.WithContext(ctx).Table("channels").Select("id, name").Where("id IN ?", channelIds.Items()).Find(&channels).Error; err != nil {
+				return logs, total, err
+			}
+		}
+		channelMap := make(map[int]string, len(channels))
+		for _, channel := range channels {
+			channelMap[channel.Id] = channel.Name
+		}
+		for i := range logs {
+			logs[i].ChannelName = channelMap[logs[i].ChannelId]
+		}
+	}
+
+	return logs, total, nil
+}
+
+// GetUserLogsWithContext is the context-aware version of GetUserLogs for exports
+func GetUserLogsWithContext(ctx context.Context, userId int, startTimestamp int64, endTimestamp int64, modelName string, content string, tokenName string, logType int, limit int, offset int) (logs []*Log, total int64, err error) {
+	var tx *gorm.DB
+	if logType == LogTypeUnknown {
+		tx = LOG_DB.WithContext(ctx).Where("logs.user_id = ?", userId)
+	} else {
+		tx = LOG_DB.WithContext(ctx).Where("logs.user_id = ? and logs.type = ?", userId, logType)
+	}
+
+	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
+		return nil, 0, err
+	}
+	if tx, err = applyExplicitLogTextFilter(tx, "logs.content", content); err != nil {
+		return nil, 0, err
+	}
+	if tokenName != "" {
+		tx = tx.Where("logs.token_name = ?", tokenName)
+	}
+	if startTimestamp != 0 {
+		tx = tx.Where("logs.created_at >= ?", startTimestamp)
+	}
+	if endTimestamp != 0 {
+		tx = tx.Where("logs.created_at <= ?", endTimestamp)
+	}
+
+	// Check context before count
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
+
+	err = tx.Model(&Log{}).Limit(logSearchCountLimit).Count(&total).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Check context before query
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
+
+	order := "logs.id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("logs.")
+	}
+	err = tx.Order(order).Limit(limit).Offset(offset).Find(&logs).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	formatUserLogs(logs, offset)
+	return logs, total, nil
+}
+
 type Stat struct {
 	Quota int `json:"quota"`
 	Rpm   int `json:"rpm"`
